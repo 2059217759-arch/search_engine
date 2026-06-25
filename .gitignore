@@ -1,0 +1,8 @@
+# Runtime
+data/
+
+# Claude
+.claude/
+ 
+# BIN
+bin/

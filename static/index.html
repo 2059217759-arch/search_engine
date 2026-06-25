@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Search Engine</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <h1 class="brand">Search Engine</h1>
+      <p class="subtitle">全文搜索引擎 · 支持中英文检索</p>
+    </header>
+
+    <div class="search-box-wrapper">
+      <div class="search-box">
+        <input
+          type="text"
+          id="searchInput"
+          class="search-input"
+          placeholder="输入关键词搜索..."
+          autocomplete="off"
+          autofocus
+        >
+        <button id="searchBtn" class="search-btn">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <circle cx="11" cy="11" r="8"/>
+            <path d="m21 21-4.35-4.35"/>
+          </svg>
+        </button>
+      </div>
+      <ul id="suggestions" class="suggestions hidden"></ul>
+    </div>
+
+    <main id="resultsArea" class="results-area">
+      <div id="statusMsg" class="status-msg">
+        <p class="welcome-icon">&#128269;</p>
+        <p>输入关键词，开始搜索</p>
+      </div>
+    </main>
+  </div>
+
+  <footer class="footer">
+    <span id="footerInfo"></span>
+  </footer>
+
+  <script src="/script.js"></script>
+</body>
+</html>
