@@ -9,11 +9,12 @@ BINDIR := bin
 SERVER_TARGET := $(BINDIR)/main
 OFFLINE_TARGET := $(BINDIR)/offline
 
-SERVER_OBJS := $(OBJDIR)/SearchServer.o $(OBJDIR)/SearchService.o $(OBJDIR)/KeywordRecommender.o
+SERVER_OBJS := $(OBJDIR)/SearchServer.o $(OBJDIR)/SearchService.o $(OBJDIR)/KeywordRecommender.o \
+               $(OBJDIR)/DenseRetriever.o
 OFFLINE_OBJS := $(OBJDIR)/offline.o $(OBJDIR)/DirectoryScanner.o \
                 $(OBJDIR)/KeywordProcessor.o $(OBJDIR)/PageProcessor.o
 
-SERVER_LDFLAGS := -lpthread -L/usr/local/lib -ltinyxml2 -lworkflow -lwfrest
+SERVER_LDFLAGS := -lpthread -L/usr/local/lib -ltinyxml2 -lworkflow -lwfrest -lcurl
 OFFLINE_LDFLAGS := -lpthread -L/usr/local/lib -ltinyxml2
 
 .PHONY: all clean

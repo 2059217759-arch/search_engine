@@ -1,13 +1,17 @@
 #include "SearchService.h"
+#include "DenseRetriever.h"
 
 #include <tinyxml2.h>
 #include <utfcpp/utf8.h>
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
 
 #include <sstream>
 #include <algorithm>
 #include <cmath>
 #include <unordered_set>
 #include <unordered_map>
+#include <iostream>
 
 using namespace std;
 using namespace tinyxml2;
@@ -48,6 +52,11 @@ SearchService::SearchService() : totalDocs_(0)
     }
 }
 
+SearchService::~SearchService()
+{
+    delete dense_;
+}
+
 bool SearchService::init(const string& pagesFile,
                          const string& offsetsFile,
                          const string& indexFile)
@@ -83,6 +92,13 @@ bool SearchService::init(const string& pagesFile,
 
     // 打开网页库供后续按 id 读取
     pagesStream_.open(pagesFile);
+
+    // try to load dense retriever (non-fatal)
+    dense_ = new DenseRetriever();
+    if (dense_->load("data/doc_embeddings.dat")) {
+        denseAvailable_ = true;
+    }
+
     return pagesStream_.good();//返回打开状态
 }
 
@@ -123,7 +139,8 @@ string SearchService::search(const string& query, int topK)
             auto it = invertedIndex_.find(term);
             if (it == invertedIndex_.end()) {
                 // 有查询词不在倒排索引中 → 无结果
-                return "[]";
+                // 但不直接返回空，因为 dense 检索可以兜底
+                continue;
             }
 
             //first标记处理第一个关键字，把他的倒排列表全部加入容器
@@ -142,7 +159,7 @@ string SearchService::search(const string& query, int topK)
                 }
                 intersectSet = move(tmp);//更新
             }
-            if (intersectSet.empty()) return "[]";
+            if (intersectSet.empty()) break;
         }
         //放到交集里
         candidateDocs.assign(intersectSet.begin(), intersectSet.end());
@@ -150,6 +167,7 @@ string SearchService::search(const string& query, int topK)
 
     // 4. 余弦相似度排序
     vector<pair<int, double>> scored;  // 文档的打分(docId, cosine)
+    unordered_map<int, double> tfidfScores; // 存下来供融合用
     for (int docId : candidateDocs) {
         //docWeight是当前的文档的关键字向量
         //如<苹果，0.999> <公司，0.88>
@@ -165,7 +183,62 @@ string SearchService::search(const string& query, int topK)
         }
         double cos = cosineSimilarity(queryVec, docWeights);//计算
         scored.emplace_back(docId, cos);
+        tfidfScores[docId] = cos;
     }
+
+    // 4.5 Dense retrieval
+    unordered_map<int, float> denseScores;
+    if (denseAvailable_) {
+
+        ////这个函数发送了请求给python微服务，返回得到向量化的查询语句
+        auto qEmb = fetchQueryEmbedding(query);
+        if (!qEmb.empty()) {
+
+            // 拿着这个向量去匹配本地的向量索引
+            auto denseResults = dense_->search(qEmb, topK * 3);
+            for (const auto& [docId, score] : denseResults)
+                denseScores[docId] = score;
+        }
+    }
+
+    //  -----------混合检索----------
+    // 4.6 分数融合: TF-IDF cosine + Dense inner product
+    if (denseAvailable_ && !denseScores.empty()) {
+        // 收集所有候选（TF-IDF 交集 + Dense top-K）
+        unordered_set<int> allCandidates;
+        for (const auto& [docId, _] : tfidfScores) allCandidates.insert(docId);
+        for (const auto& [docId, _] : denseScores)  allCandidates.insert(docId);
+
+        // 找到 TF-IDF 最大分用于归一化（虽然 cosine 本身在 [0,1]，但作为参考）
+        double maxTfidf = 0.0;
+        for (const auto& [_, s] : tfidfScores) maxTfidf = max(maxTfidf, s);
+
+        //融合过程
+        vector<pair<int, double>> fused;
+        for (int docId : allCandidates) {
+
+            //在TF-IDF稀疏集合里，赋值
+            double tfidfScore = 0.0;
+            auto itTf = tfidfScores.find(docId);
+            if (itTf != tfidfScores.end())
+                tfidfScore = itTf->second;  // cosine 已在 [0,1]
+
+            double denseScore = 0.0;
+            auto itDense = denseScores.find(docId);
+            if (itDense != denseScores.end())
+                // [-1,1] → [0,1]，统一分数为0-1之间
+                denseScore = (itDense->second + 1.0) / 2.0;  
+
+            double finalScore = alpha_ * tfidfScore + (1.0 - alpha_) * denseScore;
+            fused.emplace_back(docId, finalScore);
+        }
+
+        sort(fused.begin(), fused.end(),
+             [](const auto& a, const auto& b) { return a.second > b.second; });
+
+        scored = std::move(fused);
+    }
+    // 否则 scored 保持纯 TF-IDF 排序
 
     sort(scored.begin(), scored.end(),
          [](const auto& a, const auto& b) { return a.second > b.second; });
@@ -251,6 +324,48 @@ double SearchService::cosineSimilarity(
 
     double denom = sqrt(normQ) * sqrt(normD);
     return (denom > 0) ? dot / denom : 0.0;
+}
+
+// ===================== Dense: libcurl query embedding =====================
+// 发送http请求给python微服务
+static size_t curlWriteCallback(void* contents, size_t size, size_t nmemb,
+                                 string* out) {
+    size_t total = size * nmemb;
+    out->append(static_cast<char*>(contents), total);
+    return total;
+}
+
+vector<float> SearchService::fetchQueryEmbedding(const string& query) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return {};
+
+    nlohmann::json reqBody = {{"query", query}};
+    string reqStr = reqBody.dump();
+    string response;
+
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, embedServiceUrl_.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, reqStr.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)reqStr.size());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 3000L);
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK) return {};
+
+    try {
+        auto j = nlohmann::json::parse(response);
+        return j.at("embedding").get<vector<float>>();
+    } catch (...) {
+        return {};
+    }
 }
 
 // ===================== 加载文档 =====================

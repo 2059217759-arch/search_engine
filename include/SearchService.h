@@ -9,9 +9,13 @@
 #include <fstream>
 #include <mutex>
 
+class DenseRetriever;//前向声明
+
 class SearchService {
 public:
     SearchService();
+    ~SearchService();
+
     bool init(const std::string& pagesFile,
               const std::string& offsetsFile,
               const std::string& indexFile);
@@ -29,7 +33,6 @@ private:
         std::string content;
     };
 
-    //加载文档，返回上面的结构体
     DocMeta loadDocument(int docId);
 
     // 计算查询向量的 TF-IDF 权重（已归一化）
@@ -59,4 +62,13 @@ private:
     int totalDocs_;
     std::ifstream pagesStream_;
     std::mutex pagesMutex_;
+
+    // ---- Dense retrieval ----
+    DenseRetriever* dense_ = nullptr;
+    bool denseAvailable_ = false;
+    float alpha_ = 0.5f;                     // BM25/TF-IDF 与 dense 的融合权重
+    std::string embedServiceUrl_ = "http://localhost:8765/embed";
+
+    // 调用 Python embedding 微服务获取 query 向量
+    std::vector<float> fetchQueryEmbedding(const std::string& query);
 };

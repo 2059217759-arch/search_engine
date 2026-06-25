@@ -241,7 +241,7 @@ void PageProcessor::build_inverted_index(const string& filename)
 {
     size_t N = documents_.size();           // 文档总数
     unordered_map<string, int> df;          // 包含某个词语的文档个数
-   
+
     // tf值，某个单词string在某个id文档下的数量int
     unordered_map<int, unordered_map<string, int>> doc_tf;
 
