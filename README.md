@@ -47,7 +47,7 @@ flowchart TB
 
         KP1 --> F1[(cn_dict.dat<br/>cn_index.dat)]
         KP2 --> F2[(en_dict.dat<br/>en_index.dat)]
-        PP --> F3[(pages.dat + offsets.dat<br/>+ inverted_index.dat)]
+        PP --> F3[(pages.dat<br/>offsets.dat<br/>inverted_index.dat)]
     end
 
     subgraph 离线Embedding["🐍 离线 Embedding 生成"]
@@ -63,7 +63,7 @@ flowchart TB
         B3 --> F2
         B2 --> F3
         B2 --> F4
-        B2 --> B4[QueryCache | DocCache<br/>双层查询缓存]
+        B2 --> B4[QueryCache &#124; DocCache<br/>双层查询缓存]
         B2 -->|HTTP POST :8765| EMB[query_embedding_server.py<br/>FastAPI]
     end
 
