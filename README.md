@@ -1,14 +1,16 @@
 # 🔍 Search Engine — 全文搜索引擎
+--wzh
 
 一个基于 **C++17** 的全文搜索引擎，支持中英文混合检索，采用**稀疏检索（TF-IDF）+ 稠密检索（BERT Embedding）** 的混合召回架构，提供 Web 搜索界面和关键词自动补全/纠错功能。
 
+![alt text](Snipaste_2026-06-26_22-36-46.png)
+![alt text](Snipaste_2026-06-26_22-39-11.png)
 ## 目录
 
 - [特性](#特性)
 - [系统架构](#系统架构)
-- [离线索引流程](#离线索引流程)
-- [在线检索流程](#在线检索流程)
-- [混合检索详解](#混合检索详解)
+- [检索流程](#检索流程)
+- [缓存设计](#缓存设计)
 - [目录结构](#目录结构)
 - [依赖](#依赖)
 - [构建 & 运行](#构建--运行)
@@ -28,6 +30,8 @@
 - 🎨 **简洁 Web UI** — 仿搜索引擎风格的 SPA 前端，支持高亮、键盘导航
 - 🔄 **优雅降级** — Embedding 服务不可用时自动回退到纯 TF-IDF 检索
 - 🧹 **近重复检测** — 基于 SimHash + 海明距离的文档去重
+- 🚀 **双层缓存** — L1 查询结果缓存 + L3 文档内容缓存，大幅减少重复计算和磁盘 I/O
+- 📊 **实时热门** — 基于用户点击行为的热门文档追踪，min-heap Top-K 排行，前端实时展示
 
 ---
 
@@ -43,26 +47,27 @@ flowchart TB
 
         KP1 --> F1[(cn_dict.dat<br/>cn_index.dat)]
         KP2 --> F2[(en_dict.dat<br/>en_index.dat)]
-        PP --> F3[(pages.dat<br/>offsets.dat<br/>inverted_index.dat)]
+        PP --> F3[(pages.dat + offsets.dat<br/>+ inverted_index.dat)]
     end
 
     subgraph 离线Embedding["🐍 离线 Embedding 生成"]
-        F3 -->|读取 pages.dat| GEN[generate_doc_embeddings.py<br/>BAAI/bge-small-zh-v1.5]
+        F3 -->|读取 pages.dat| GEN[generate_doc_embeddings.py<br/>BGE-small-zh-v1.5]
         GEN --> F4[(doc_embeddings.dat)]
     end
 
     subgraph 在线模块["🌐 在线搜索服务 (bin/main)"]
         direction TB
-        B1[wfrest HTTP Server<br/>:8080] --> B2[SearchService]
+        B1[wfrest HTTP Server :8080] --> B2[SearchService]
         B2 --> B3[KeywordRecommender<br/>Trie 前缀 + 编辑距离]
         B3 --> F1
         B3 --> F2
         B2 --> F3
         B2 --> F4
+        B2 --> B4[QueryCache | DocCache<br/>双层查询缓存]
         B2 -->|HTTP POST :8765| EMB[query_embedding_server.py<br/>FastAPI]
     end
 
-    UI[🖥️ static/index.html<br/>搜索 UI] -->|GET /search<br/>GET /suggest| B1
+    UI[🖥️ static/index.html<br/>搜索 UI] -->|GET /search<br/>GET /suggest<br/>GET /hot| B1
 
     style 离线模块 fill:#fff3e0,stroke:#ff9800
     style 离线Embedding fill:#e8f5e9,stroke:#4caf50
@@ -70,182 +75,198 @@ flowchart TB
     style UI fill:#fce4ec,stroke:#e91e63
 ```
 
-## 离线索引流程
+## 检索流程
+
+### 关键字推荐流程
 
 ```mermaid
 flowchart TD
-    START((开始)) --> SCAN[DirectoryScanner<br/>扫描语料目录]
+    A["🔤 用户输入"] --> B["GET /suggest?q=prefix"]
+    B --> C["KeywordRecommender::suggest()"]
 
-    SCAN --> CN{语料类型?}
+    C --> D["阶段一：Trie 前缀匹配"]
+    D --> E["UTF-8 沿 Trie 走到前缀节点"]
+    E --> F{"前缀节点存在？"}
+    F -->|"是"| G["栈 DFS 收集子树词<br/>按词频降序取 topK → prefix"]
+    F -->|"否"| H["前缀结果为空"]
 
-    CN -->|中文 TXT| K_CN[jieba Cut 分词]
-    CN -->|英文 TXT| K_EN[空格分词 + 小写化]
-    CN -->|RSS XML| K_XML[tinyxml2 解析<br/>&lt;rss&gt;&lt;channel&gt;&lt;item&gt;]
+    G --> I{"prefix 结果 ≥ topK？"}
+    I -->|"是"| J["直接返回"]
+    I -->|"否"| K["保留结果，触发纠错兜底"]
+    H --> K
 
-    K_CN --> SW1[过滤停用词]
-    K_EN --> SW2[过滤停用词 + 非字母]
-    K_XML --> HTML[strip HTML 标签<br/>decode HTML 实体]
+    K --> L["阶段二：编辑距离纠错"]
+    L --> M["动态 maxDist<br/>≤2→1 | ≤5→2 | >5→3"]
+    M --> N["遍历词典，长度预过滤<br/>DP 编辑距离（滚动数组）"]
+    N --> O["优先队列：距离小 → 词频高<br/>过滤 prefix 已出现词"]
 
-    SW1 --> DICT1[词频统计 → cn_dict.dat]
-    SW1 --> IDX1[字符→词索引 → cn_index.dat]
-    SW2 --> DICT2[词频统计 → en_dict.dat]
-    SW2 --> IDX2[字符→词索引 → en_index.dat]
+    O --> P["==== 阶段三：合并返回 ===="]
+    J --> P
+    P --> Q["前缀结果 + 纠错结果（缺）<br/>构建 JSON: word/freq/type"]
+    Q --> R["前端渲染补全列表<br/>↑↓选择 | Enter | Esc"]
 
-    HTML --> DEDUP[SimHash 64-bit 计算]
-    DEDUP --> HAM{海明距离 ≤ 3?}
-    HAM -->|是| DROP[丢弃重复文档]
-    HAM -->|否| KEEP[保留文档]
-    KEEP --> PAGES[写入 pages.dat<br/>+ offsets.dat]
-
-    KEEP --> TFIDF[分词 + TF-IDF 计算]
-    TFIDF --> NORM[L2 归一化]
-    NORM --> INV[构建倒排索引<br/>→ inverted_index.dat]
-
-    PAGES --> DONE((完成))
-    INV --> DONE
-    DICT1 --> DONE
-    DICT2 --> DONE
-    IDX1 --> DONE
-    IDX2 --> DONE
-
-    DONE -->|Python 离线脚本| EMB[读取 pages.dat<br/>BGE 模型编码]
-    EMB --> EMBFILE[(doc_embeddings.dat<br/>二进制格式)]
+    style D fill:#fff3e0,stroke:#ff9800
+    style L fill:#e8f5e9,stroke:#4caf50
+    style P fill:#e3f2fd,stroke:#2196f3
 ```
 
-### 数据文件格式
+### 网页搜索流程
 
-| 文件 | 格式 | 说明 |
+```mermaid
+flowchart TD
+    A["🔍 用户提交搜索"] --> B["GET /search?q=query"]
+    B --> B0{"L1 QueryCache 命中？"}
+    B0 -->|"是 → 直接返回"| B1["返回缓存 JSON"]
+    B0 -->|"否"| C["jieba 分词 + 停用词过滤<br/>计算 TF-IDF 向量 (L2归一化)"]
+    C --> D{"有效关键词 ≥ 1？"}
+    D -->|"否"| D1["返回 []"]
+    D -->|"是"| E["══════ 稀疏检索 ══════"]
+
+    E --> F["倒排索引 AND 求交集<br/>所有词都命中的文档入选"]
+    F --> G{"交集非空？"}
+    G -->|"否"| G1["候选 = ∅"]
+    G -->|"是"| H["Cosine 相似度排序<br/>scores ∈ [0, 1]"]
+
+    E --> I["══════ 稠密检索 ══════"]
+    I --> J{"DenseRetriever 已加载？"}
+    J -->|"否"| J1["跳过"]
+    J -->|"是"| K["POST → Embedding服务<br/>BGE 384维 · 超时 3s"]
+    K --> L{"成功？"}
+    L -->|"否/超时/解析失败"| L1["优雅降级：返回空"]
+    L -->|"是"| M["c++暴力内积计算匹配<br/>topK×3 → scores ∈ [-1, 1]"]
+
+    E --> N["══════ 融合 ══════"]
+    H --> N
+    G1 --> N
+    J1 --> N
+    L1 --> N
+    M --> N
+
+    N --> O{"Dense 可用且结果非空？"}
+    O -->|"否 → 纯稀疏"| P["按 Cosine 降序"]
+    O -->|"是 → 混合"| Q["候选 = 稀疏 ∪ 稠密 <br/>Dense归一化<br/>final = 0.5×稀疏 + 0.5×稠密"]
+
+    P --> R["Top-K 排序"]
+    Q --> R
+    R --> S["loadDocument() 逐个加载<br/>→ L3 DocCache 查缓存<br/>→ 未命中: seekg+read+XML解析<br/>→ 动态摘要生成"]
+    S --> S2["结果 → L1 put"]
+    S2 --> T["返回 JSON<br/>id/title/link/abstract/scores"]
+    T --> U["前端渲染 + 关键词高亮<br/>右侧热门面板刷新"]
+
+    style E fill:#fff3e0,stroke:#ff9800
+    style I fill:#e8f5e9,stroke:#4caf50
+    style N fill:#e3f2fd,stroke:#2196f3
+```
+
+> **融合策略：** 稀疏检索 AND 语义保证精度，稠密检索捕获语义相关但字面不匹配的文档。候选集取并集，α=0.5 加权融合。Embedding 文件缺失/服务不可达/超时/解析失败均自动回退到纯 TF-IDF，不影响主流程。
+
+---
+
+## 缓存设计
+
+搜索引擎采用**双层缓存架构**，从查询级别到文档级别逐层消除重复计算和 I/O。热门文档追踪独立于缓存体系，基于用户点击行为驱动。
+
+```
+用户搜索 "比特币"
+  │
+  ├─ L1 QueryCache (query → JSON)
+  │     Key:   "比特币" (trim + lowercase 标准化)
+  │     Value: JSON 字符串
+  │     策略:  LRU + TTL (1000 条 / 5 min)
+  │     命中:  跳过全部后续计算，直接返回 JSON
+  │
+  └─ L1 未命中 → 完整检索流程
+       ├─ 分词 → TF-IDF → 倒排交集 → 余弦 → Dense → 融合排序
+       ├─ 构建 JSON 时逐个 loadDocument(docId)
+       │     │
+       │     └─ L3 DocCache (docId → DocMeta)
+       │           Key:   int docId
+       │           Value: DocMeta { title, link, content }
+       │           策略:  LRU (500 篇)
+       │           命中:  零 I/O 返回文档内容
+       │           未命中: seekg + read + XML 解析 → put 缓存
+       │
+       └─ 结果 JSON → L1 put
+
+用户点击标题 → POST /click?id=xxx → HotTracker.recordClick()
+       │
+       └─ GET /hot?k=10 → 按点击次数排名 → 右侧热门面板渲染
+            (unordered_map 计数 + min-heap Top-K)
+```
+
+### 各层对比
+
+| 层 | 类 | Key | Value | 容量 | TTL | 数据结构 | 收益 |
+|----|----|-----|-------|------|-----|----------|------|
+| L1 | `QueryCache` | query string | JSON | 1000 | 5 min | LRU list + hashmap | 省全部计算 |
+| L2 | *(规划中)* | query string | `vector<float>` | — | — | — | 省 HTTP 3s |
+| L3 | `DocCache` | int docId | DocMeta | 500 | 无 | LRU list + hashmap | 省磁盘 I/O |
+
+> **注意：** HotTracker 不属于缓存层。它是独立的用户行为追踪模块，仅对用户点击（`POST /click`）作出反应，与 L1/L2/L3 缓存无耦合。
+
+### 线程安全
+
+缓存层均使用 `std::shared_mutex` 读写锁：
+- **读操作**（`get`）：`shared_lock`，允许多线程并发读
+- **写操作**（`put`/`evict`）：`unique_lock`，独占写
+
+HotTracker 同样使用 `shared_mutex` 保护 `recordClick()` / `topK()`。
+
+搜索场景读远多于写，读写锁避免了不必要的互斥开销。
+
+### 热门文档追踪算法
+
+```
+HotTracker:
+  recordClick(docId):
+    counts_[docId]++               ← O(1) 增量更新
+  
+  topK(k):
+    if clickCount == 0: skip       ← 只关注被点击过的文档
+    min-heap (小根堆) size=k         ← O(N log K)
+    for each (docId, clickCount):
+      if heap.size < k: push
+      else if clickCount > heap.top: pop + push
+    return reverse(heap)            ← 降序输出
+```
+
+选择 min-heap 而非全排序是因为 K=10 ≪ N（文档总数），O(N log K) ≈ O(N)，胜过 `std::sort` 的 O(N log N)。
+
+---
+
+## 日志系统
+
+基于 **spdlog**（v1.14.1, header-only）的结构化日志，替换零散的 `cout`/`cerr` 输出。
+
+### 输出目标
+
+| 目标 | 级别 | 说明 |
 |------|------|------|
-| `pages.dat` | 拼接的 `<doc>` XML 块 | 网页库，按文档 ID 顺序排列 |
-| `offsets.dat` | `doc_id\tbyte_offset\tbyte_size` | 每行记录一个文档在 pages.dat 中的偏移 |
-| `inverted_index.dat` | `keyword\tdocId\tweight\tdocId\tweight...` | TF-IDF 倒排索引，权重已 L2 归一化 |
-| `cn_dict.dat` / `en_dict.dat` | `word\tfrequency` | 关键词词典，用于 autocomplete |
-| `cn_index.dat` / `en_index.dat` | `char\tword1\tword2...` | 字符到词的映射，用于编辑距离候选集 |
-| `doc_embeddings.dat` | 二进制: `MAGIC(4B) N(4B) dim(4B) [id(4B)+vec(dim×4B)]×N` | 稠密向量索引，MAGIC=0x44454D42 ("DEMB") |
+| 控制台 | INFO+ | 彩色格式，开发时实时查看 |
+| `logs/search.log` | TRACE+ | 每日 0 点轮转，保留最近 7 天 |
 
-## 在线检索流程
+### 日志级别使用策略
 
-```mermaid
-sequenceDiagram
-    actor User as 用户
-    participant UI as 浏览器 (static/)
-    participant SVR as wfrest HTTP Server<br/>:8080
-    participant SRV as SearchService
-    participant JIEBA as cppjieba 分词器
-    participant INV as 倒排索引<br/>(内存)
-    participant EMB as Python Embedding<br/>:8765
-    participant DR as DenseRetriever
-    participant DSK as pages.dat<br/>(磁盘)
-
-    User->>UI: 输入关键词
-    UI->>SVR: GET /suggest?q=词
-    SVR->>SRV: KeywordRecommender.suggest()
-    SRV-->>SVR: JSON 补全/纠错结果
-    SVR-->>UI: 下拉提示列表
-
-    User->>UI: 点击搜索 / 回车
-    UI->>SVR: GET /search?q=关键词
-
-    SVR->>SRV: search(query)
-    SRV->>JIEBA: Cut(query) 分词
-    JIEBA-->>SRV: 关键词列表
-
-    SRV->>SRV: 过滤停用词
-    SRV->>SRV: computeQueryVector()<br/>TF-IDF + L2 归一化
-
-    par 稀疏检索
-        SRV->>INV: 查询词倒排列表
-        INV-->>SRV: posting lists
-        SRV->>SRV: 交集 (AND 语义)
-        SRV->>SRV: Cosine Similarity 排序
-    and 稠密检索 (可选)
-        SRV->>EMB: POST /embed {"query":"..."}
-        EMB-->>SRV: embedding vector [384维]
-        SRV->>DR: search(embedding, topK×3)
-        DR-->>SRV: 稠密相似度结果
-    end
-
-    SRV->>SRV: 分数融合<br/>final = α×TF-IDF + (1-α)×Dense
-    SRV->>SRV: 排序 + Top-K 截断
-
-    loop 每个结果文档
-        SRV->>DSK: seekg(offset) + read(size) 🔒 mutex
-        DSK-->>SRV: XML &lt;doc&gt; 块
-        SRV->>SRV: 解析 title/link/content
-        SRV->>SRV: generateAbstract() 截断 300 字节
-    end
-
-    SRV-->>SVR: JSON 搜索结果
-    SVR-->>UI: [{id, title, link, abstract}, ...]
-    UI->>UI: 渲染结果 + 关键词高亮
+```
+TRACE  — 缓存逐出/命中、TTL 过期、embedding 维度
+DEBUG  — 每次搜索的关键词/候选数/融合模式、缓存命中/未命中
+INFO   — 服务启动、索引加载、离线阶段完成
+WARN   — Embedding 文件缺失/服务超时、dense 不可用（优雅降级）
+ERROR  — 文件打开失败、服务启动失败
 ```
 
-## 混合检索详解
+### 使用示例
 
-```mermaid
-flowchart LR
-    Q[用户查询] --> TOK[分词 + 去停用词]
-    TOK --> QVEC[TF-IDF 查询向量<br/>L2 归一化]
+```cpp
+#include "Logger.h"
 
-    QVEC --> SPARSE[稀疏检索支路]
-    QVEC --> DENSE[稠密检索支路]
-
-    subgraph SPARSE[稀疏检索]
-        S1[取倒排列表交集<br/>AND 语义] --> S2[Cosine Similarity<br/>计算每个候选文档]
-        S2 --> S3[sparseScores<br/>范围: 0~1]
-    end
-
-    subgraph DENSE[稠密检索]
-        D1[POST /embed<br/>BGE 模型编码] --> D2[查询向量 384维<br/>归一化]
-        D2 --> D3[Dot Product<br/>与所有文档向量]
-        D3 --> D4[denseScores<br/>范围: -1~1]
-        D4 --> D5[归一化: (score+1)/2<br/>范围: 0~1]
-    end
-
-    S3 --> FUSE[线性加权融合<br/>final = 0.5×sparse + 0.5×dense]
-    D5 --> FUSE
-
-    FUSE --> SORT[降序排序 → Top-K]
-    SORT --> LOAD[加载完整文档]
-    LOAD --> RESULT[JSON 结果]
-
-    style SPARSE fill:#fff8e1,stroke:#ff8f00
-    style DENSE fill:#e8eaf6,stroke:#3f51b5
-    style FUSE fill:#fce4ec,stroke:#e91e63
+LOG_INFO("Index loaded: {} documents", totalDocs);
+LOG_DEBUG("L1 cache hit for query: \"{}\"", query);
+LOG_WARN("Dense retriever not available, will use TF-IDF only");
+LOG_ERROR("Failed to open offsets file: {}", path);
 ```
 
-**融合策略：**
-- 稠密分数从 [-1, 1] 映射到 [0, 1]，与 TF-IDF cosine 对齐
-- 候选集 = 稀疏交集文档 ∪ 稠密 Top-3K 文档
-- 融合权重 α = 0.5（可配置），稀疏和稠密各占一半
-- 稠密服务不可用时自动回退到纯 TF-IDF
-
-### 关键词推荐流程
-
-```mermaid
-flowchart TD
-    Q[输入前缀] --> TRIE[Trie 前缀遍历]
-    TRIE --> COLLECT[DFS 收集子树下<br/>所有完整词]
-    COLLECT --> SORT[按词频降序]
-
-    SORT --> SUFF{结果 ≥ 5?}
-    SUFF -->|是| JSON1[标注 type: prefix]
-    SUFF -->|否| ED[编辑距离扫描<br/>全词典]
-
-    ED --> FILTER[按长度差剪枝<br/>maxDist = f(len)]
-    FILTER --> TOP[取最小编辑距离词<br/>按词频排序]
-    TOP --> JSON2[标注 type: correction]
-
-    JSON1 --> OUTPUT[JSON 结果]
-    JSON2 --> OUTPUT
-```
-
-**编辑距离阈值策略：**
-| 查询长度 | 最大编辑距离 | 原因 |
-|---------|------------|------|
-| ≤ 2 字符 | 1 | 短词容易过度纠错 |
-| ≤ 5 字符 | 2 | 中等长度允许更多差异 |
-| > 5 字符 | 3 | 长词容忍更大编辑距离 |
+> 所有 `LOG_*` 宏自动携带时间戳、文件名和行号，格式为 `[2026-06-26 21:30:05.123] [info] [SearchServer.cc:22] message`。
 
 ---
 
@@ -263,24 +284,31 @@ Search_Engine_cpp/
 │
 ├── build/                          # 中间目标文件 (gitignored)
 │
-├── include/                        # 头文件 (7 个)
+├── include/                        # 头文件 (11 个)
 │   ├── DirectoryScanner.h          # 目录扫描器
 │   ├── KeywordProcessor.h          # 关键词词典构建器
 │   ├── KeywordRecommender.h        # Trie + 编辑距离推荐
+│   ├── Logger.h                    # 全局日志系统（spdlog 封装）
 │   ├── PageProcessor.h             # 网页索引构建器
 │   ├── SearchServer.h              # HTTP 服务入口
 │   ├── SearchService.h             # 搜索核心逻辑
-│   └── DenseRetriever.h            # 稠密向量检索器
+│   ├── DenseRetriever.h            # 稠密向量检索器
+│   ├── QueryCache.h                # L1 查询结果缓存 (LRU + TTL)
+│   ├── HotTracker.h                # 热门文档追踪 (min-heap Top-K)
+│   └── DocCache.h                  # L3 文档内容缓存 (LRU)
 │
-├── src/                            # 源文件 (8 个)
+├── src/                            # 源文件 (11 个)
 │   ├── offline.cc                  # 离线流水线入口
 │   ├── DirectoryScanner.cc         # POSIX 目录遍历
 │   ├── KeywordProcessor.cc         # 中英文词典构建
 │   ├── KeywordRecommender.cc       # Trie 实现 + 编辑距离
 │   ├── PageProcessor.cc            # XML 解析 + SimHash + TF-IDF
 │   ├── SearchServer.cc             # main() + HTTP 路由
-│   ├── SearchService.cc            # 搜索 + 融合 + libcurl
-│   └── DenseRetriever.cc           # 二进制向量加载 + dot product
+│   ├── SearchService.cc            # 搜索 + 融合 + 缓存 + libcurl
+│   ├── DenseRetriever.cc           # 二进制向量加载 + dot product
+│   ├── QueryCache.cc               # L1 缓存实现
+│   ├── HotTracker.cc               # 热门追踪实现
+│   └── DocCache.cc                 # L3 缓存实现
 │
 ├── embedding/                      # Python Embedding 服务
 │   ├── requirements.txt            # sentence-transformers, fastapi...
@@ -291,6 +319,12 @@ Search_Engine_cpp/
 │   ├── index.html                  # SPA 主页面
 │   ├── style.css                   # 仿 Google 风格样式
 │   └── script.js                   # 搜索逻辑 + 联想补全
+│
+├── third_party/                    # 第三方 Header-only 库
+│   └── spdlog/                     # spdlog v1.14.1 (日志库)
+│
+├── logs/                           # 运行日志 (gitignored)
+│   └── search.log                  # 按天轮转，保留 7 天
 │
 ├── corpus/                         # 原始语料
 │   ├── CN/*.txt                    # 中文文本
@@ -324,6 +358,7 @@ Search_Engine_cpp/
 | **workflow** | 异步网络框架 (wfrest 依赖) | 动态链接 (`-lworkflow`) |
 | **wfrest** | HTTP 服务框架 (路由、CORS、静态文件) | 动态链接 (`-lwfrest`) |
 | **libcurl** | HTTP 客户端 (调用 Python embedding 服务) | 动态链接 (`-lcurl`) |
+| **spdlog** | 结构化日志（控制台 + 文件双输出） | Header-only |
 | **nlohmann/json** | JSON 序列化/反序列化 | Header-only |
 | **utfcpp** | UTF-8 字符级迭代 | Header-only |
 
@@ -428,10 +463,12 @@ GET /search?q=<query>
     "id": 42,
     "title": "文章标题",
     "link": "https://example.com/article",
-    "abstract": "内容摘要...（最多 300 字节）"
+    "abstract": "动态摘要：定位到最早出现的关键词，提取含上下文片段的窗口（≤300 字节），关键词高亮"
   }
 ]
 ```
+
+> **摘要生成：** 采用动态摘要策略 — 在文档内容中大小写不敏感定位所有查询关键词，选取最早出现的匹配位置，以关键词为中心提取约 300 字节的上下文窗口，两端对齐 UTF-8 字符边界并加 `...` 省略号。若文档中无关键词匹配，则回退到文档前 300 字节的静态摘要。
 
 ### 关键词推荐
 
@@ -450,6 +487,45 @@ GET /suggest?q=<prefix>
 
 - `type: "prefix"` — Trie 前缀匹配结果
 - `type: "correction"` — 编辑距离纠错结果
+
+### 热门文档
+
+```
+GET /hot?k=10
+```
+
+返回用户点击次数最高的 Top-K 文档（基于 HotTracker 的 min-heap 统计）。
+
+**响应：**
+
+```json
+[
+  {
+    "rank": 1,
+    "id": 42,
+    "title": "热门文章标题",
+    "link": "https://example.com/hot",
+    "clickCount": 156
+  }
+]
+```
+
+- `rank` — 排名（1~K）
+- `clickCount` — 用户累计点击次数
+
+### 点击上报
+
+```
+POST /click?id=<docId>
+```
+
+用户点击搜索结果或热门列表中的文档标题时，前端自动发送此请求上报点击数。
+
+**响应：**
+
+```json
+{"ok": true}
+```
 
 ### 健康检查
 
@@ -486,14 +562,20 @@ Content-Type: application/json
 | Embedding 服务地址 | `http://localhost:8765/embed` | [SearchService.h](include/SearchService.h#L70) | Python 微服务 URL |
 | 融合权重 α | 0.5 | [SearchService.h](include/SearchService.h#L69) | TF-IDF 与 Dense 的融合比例 |
 | 搜索结果数量 | 20 | [SearchService.cc](src/SearchService.cc#L107) | 每次搜索返回 Top-K |
-| 摘要最大长度 | 300 字节 | [SearchService.cc](src/SearchService.cc#L255) | 按 UTF-8 边界截断 |
+| 摘要最大长度 | 300 字节 | [SearchService.cc](src/SearchService.cc#L458) | 动态摘要上下文窗口大小 |
 | 推荐数量 | 5 | [KeywordRecommender.h](include/KeywordRecommender.h#L17) | suggest 接口返回数 |
 | Dense 检索候选倍数 | 3× | [SearchService.cc](src/SearchService.cc#L198) | 稠密检索候选数 = topK × 3 |
 | Embedding 超时 | 3000ms | [SearchService.cc](src/SearchService.cc#L355) | libcurl 超时 |
+| L1 QueryCache 容量 | 1000 条 | [SearchService.h](include/SearchService.h#L82) | LRU 淘汰，可运行时调整 |
+| L1 QueryCache TTL | 300s (5 min) | [SearchService.h](include/SearchService.h#L82) | 过期自动失效 |
+| L3 DocCache 容量 | 500 篇 | [SearchService.h](include/SearchService.h#L84) | LRU 淘汰 |
 | Embedding 维度 | 384 | BGE 模型决定 | `BAAI/bge-small-zh-v1.5` |
 | SimHash TopN | max(5, min(200, len/120)) | [PageProcessor.cc](src/PageProcessor.cc#L186) | 动态计算 |
 | SimHash 去重阈值 | 海明距离 ≤ 3 | [PageProcessor.cc](src/PageProcessor.cc#L198) | 视为重复 |
 | Embedding 文件 Magic | `0x44454D42` | [DenseRetriever.cc](src/DenseRetriever.cc#L10) | "DEMB" ASCII |
+| 日志文件路径 | `logs/search.log` | [Logger.h](include/Logger.h) | 每日 0 点轮转 |
+| 日志控制台级别 | `info` | [Logger.h](include/Logger.h) | 文件级别为 `trace` |
+| 日志保留天数 | 7 天 | [Logger.h](include/Logger.h) | spdlog daily_sink 默认 |
 
 ---
 
@@ -524,11 +606,19 @@ Content-Type: application/json
 
 采用 SimHash 64-bit 指纹 + 海明距离进行近重复检测。虽然 O(n²) 复杂度，但在语料规模适中（几千到几万篇）时完全可接受，且离线流程对性能不敏感。
 
-### 5. 线程安全的流式文档读取
+### 5. 文档内容缓存（L3 DocCache）
 
-`pagesStream_` 由多个 HTTP 请求线程并发访问（每个请求需要加载 Top-K 文档的内容），通过 `std::mutex` 保护 `seekg` + `read` 的原子性。不将全部文档加载到内存以控制内存占用。
+热门文档在不同查询的结果中反复出现，每次都 `seekg` + `read` + XML 解析会浪费大量 I/O。L3 `DocCache` 以 `docId` 为 Key 缓存解析后的 `DocMeta`（title、link、content），LRU 淘汰策略，容量 500 篇。缓存命中后直接返回，零磁盘 I/O。`shared_mutex` 保证并发读不互斥。
 
-### 6. 优雅降级
+### 6. 查询结果缓存（L1 QueryCache）
+
+搜索查询遵循 Zipf 长尾分布，头部 query 被反复搜索。L1 `QueryCache` 缓存 query → JSON 结果的映射，LRU + TTL（默认 1000 条/5分钟）。命中时跳过全部分词、倒排、排序、文档加载流程，直接返回缓存 JSON。
+
+### 7. 热门文档追踪（HotTracker）
+
+HotTracker 是独立的用户行为追踪模块，与 L1/L2/L3 缓存无耦合。仅对用户点击（`POST /click`）作出反应：`unordered_map<docId, clickCount>` 实时计数 + `min-heap` 提取 Top-K，时间复杂度 O(N log K)。右侧热门面板通过 `/hot?k=10` 获取按点击次数降序的实时排行，点击数为 0 的文档不进入排行。
+
+### 8. 优雅降级
 
 Dense 检索模块的每个环节都有容错：
 - `doc_embeddings.dat` 不存在 → 跳过稠密检索
@@ -536,7 +626,7 @@ Dense 检索模块的每个环节都有容错：
 - JSON 解析失败 → 返回空向量
 - 任何错误不影响主搜索流程
 
-### 7. 单文件 SPA 前端
+### 9. 单文件 SPA 前端
 
 前端为纯静态 HTML + CSS + JS，不依赖任何框架或构建工具：
 - 关键字提取在客户端完成（正则匹配中英文 Token）
@@ -550,11 +640,15 @@ Dense 检索模块的每个环节都有容错：
 
 - [ ] 引入 BM25 替代 TF-IDF
 - [ ] 分页支持（大结果集懒加载）
-- [ ] 搜索结果缓存（LRU）
+- [x] 搜索结果缓存 — L1 QueryCache (LRU + TTL)
+- [x] 文档内容缓存 — L3 DocCache (LRU)
+- [x] 热门文档 Top-K 面板 — HotTracker (min-heap)
+- [x] 全局日志系统 — spdlog 控制台 + 文件双输出
 - [ ] 配置文件支持（TOML/YAML）
 - [ ] Docker 一键部署
 - [ ] 增量索引更新
 - [ ] 搜索日志与点击率统计
+- [ ] Query Embedding 缓存 — L2
 - [ ] 更多 Embedding 模型可选（如 multilingual-e5）
 
 ---

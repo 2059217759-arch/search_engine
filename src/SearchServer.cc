@@ -1,4 +1,5 @@
 #include "SearchServer.h"
+#include "Logger.h"
 
 #include <wfrest/CodeUtil.h>
 
@@ -16,17 +17,17 @@ int SearchServer::run(int port)
     if (!searchService_.init("data/pages.dat",
                              "data/offsets.dat",
                              "data/inverted_index.dat")) {
-        cerr << "Failed to load search index files" << endl;
+        LOG_ERROR("Failed to load search index files");
         return 1;
     }
-    cout << "Index loaded: " << searchService_.getTotalDocs() << " documents" << endl;
+    LOG_INFO("Index loaded: {} documents", searchService_.getTotalDocs());
 
     // 加载关键字推荐数据（Trie）
     if (!recommender_.init("data/cn_dict.dat", "data/en_dict.dat")) {
-        cerr << "Failed to load dict files for recommender" << endl;
+        LOG_ERROR("Failed to load dict files for recommender");
         return 1;
     }
-    cout << "Recommender Trie loaded" << endl;
+    LOG_INFO("Recommender Trie loaded");
 
     HttpServer server;
 
@@ -56,6 +57,27 @@ int SearchServer::run(int port)
         resp->add_header("Content-Type", "application/json; charset=utf-8");
     });
 
+    // GET /hot?k=10  热门文档 Top-K ，每次刷新时会发请求
+    server.GET("/hot", [this](const HttpReq* req, HttpResp* resp) {
+        string kStr = req->query("k");
+        int k = kStr.empty() ? 10 : stoi(kStr);
+        string result = searchService_.hotPages(k);
+        resp->String(result);
+        resp->add_header("Access-Control-Allow-Origin", "*");
+        resp->add_header("Content-Type", "application/json; charset=utf-8");
+    });
+
+    // POST /click?id=xxx  用户点击上报，为了热度排行
+    server.POST("/click", [this](const HttpReq* req, HttpResp* resp) {
+        string idStr = req->query("id");
+        if (!idStr.empty()) {
+            searchService_.recordClick(stoi(idStr));
+        }
+        resp->String("{\"ok\":true}");
+        resp->add_header("Access-Control-Allow-Origin", "*");
+        resp->add_header("Content-Type", "application/json; charset=utf-8");
+    });
+
     // 首页
     server.GET("/", [](const HttpReq*, HttpResp* resp) {
         resp->File("static/index.html");
@@ -65,15 +87,15 @@ int SearchServer::run(int port)
     server.Static("/", "static/");
 
     if (server.start(port) == 0) {
-        cout << "Server listening on http://localhost:" << port << endl;
-        cout << "Press Ctrl+C to stop" << endl;
+        LOG_INFO("Server listening on http://localhost:{}", port);
+        LOG_INFO("Press Ctrl+C to stop");
 
         sigset_t mask; // 声明信号集合
         sigemptyset(&mask); // 清空
         sigaddset(&mask, SIGINT);
         sigaddset(&mask, SIGTERM); // 这两放进去
         if (pthread_sigmask(SIG_BLOCK, &mask, nullptr) != 0) {
-            cerr << "Failed to block SIGINT/SIGTERM" << endl;
+            LOG_ERROR("Failed to block SIGINT/SIGTERM");
             server.stop();
             return 1;
         }
@@ -87,7 +109,7 @@ int SearchServer::run(int port)
         return 0;
     }
 
-    cerr << "Failed to start server on port " << port << endl;
+    LOG_ERROR("Failed to start server on port {}", port);
     return 1;
 }
 

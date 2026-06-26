@@ -1,4 +1,5 @@
 #include "DenseRetriever.h"
+#include "Logger.h"
 
 #include <fstream>
 #include <queue>
@@ -12,14 +13,20 @@ static constexpr uint32_t EMB_MAGIC = 0x44454D42;  // "DEMB"
 bool DenseRetriever::load(const string& path)
 {
     ifstream ifs(path, ios::binary);
-    if (!ifs) return false;
+    if (!ifs) {
+        LOG_WARN("DenseRetriever: embedding file not found ({}), dense retrieval disabled", path);
+        return false;
+    }
 
     //取前 4 个字节作为 magic 数。这是一个常见的文件格式校验机制。如果读取到的魔数
     //与预期的 EMB_MAGIC 不匹配，说明这不是一个合法的向量索引文件，直接返回 false
     uint32_t magic;
     int32_t numDocs;//接着读取 4 个字节，表示文件中包含多少个文档向量
     ifs.read(reinterpret_cast<char*>(&magic), 4);
-    if (magic != EMB_MAGIC) return false;
+    if (magic != EMB_MAGIC) {
+        LOG_WARN("DenseRetriever: invalid magic number in {}, dense retrieval disabled", path);
+        return false;
+    }
     ifs.read(reinterpret_cast<char*>(&numDocs), 4);
 
     //获取每个向量维度，就是每个文档维度
@@ -40,7 +47,13 @@ bool DenseRetriever::load(const string& path)
         embeddings_.push_back(move(vec));//移动语义避免深拷贝
     }
 
-    return ifs.good();
+    if (ifs.good()) {
+        LOG_INFO("DenseRetriever: loaded {} doc embeddings ({} dims) from {}",
+                 numDocs, dim_, path);
+        return true;
+    }
+    LOG_ERROR("DenseRetriever: read error while loading {}", path);
+    return false;
 }
 
 vector<pair<int, float>> DenseRetriever::search(

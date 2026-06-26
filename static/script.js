@@ -6,6 +6,7 @@
   const header = document.querySelector('.header');
   const footerInfo = document.getElementById('footerInfo');
   const statusMsg = document.getElementById('statusMsg');
+  const hotList = document.getElementById('hotList');
 
   let suggestIdx = -1;
   let suggestData = [];
@@ -20,6 +21,58 @@
       }
     })
     .catch(() => {});
+
+  // ── Hot pages ──
+  function loadHotPages() {
+    fetch('/hot?k=10')
+      .then(r => r.json())
+      .then(data => {
+        renderHotPages(data);
+      })
+      .catch(() => {
+        hotList.innerHTML = '<li class="hot-loading">加载失败</li>';
+      });
+  }
+
+  function renderHotPages(data) {
+    if (!Array.isArray(data) || data.length === 0) {
+      hotList.innerHTML = '<li class="hot-loading">暂无数据<br><span style="font-size:0.75rem;">搜索后出现</span></li>';
+      return;
+    }
+
+    hotList.innerHTML = data.map(item => {
+      const title = escapeHtml(item.title || '无标题');
+      const link = escapeHtml(item.link || '');
+      const rank = item.rank || 0;
+      const clickCount = item.clickCount || 0;
+      const rankClass = rank <= 3 ? ' top' + rank : '';
+      return (
+        '<li class="hot-item' + rankClass + '" data-id="' + item.id + '" data-link="' + escapeAttr(item.link) + '" title="' + escapeAttr(item.title) + '">' +
+          '<span class="hot-rank">' + rank + '</span>' +
+          '<div class="hot-info">' +
+            '<div class="hot-item-title">' + title + '<span class="hot-click-count">' + clickCount + '</span></div>' +
+          '</div>' +
+        '</li>'
+      );
+    }).join('');
+
+    // 点击跳转 + 上报点击数
+    hotList.querySelectorAll('.hot-item').forEach(el => {
+      el.addEventListener('click', function () {
+        const docId = this.getAttribute('data-id');
+        const url = this.getAttribute('data-link');
+        // 上报点击
+        if (docId) {
+          fetch('/click?id=' + encodeURIComponent(docId), { method: 'POST' })
+            .catch(() => {});
+        }
+        if (url) window.open(url, '_blank');
+      });
+    });
+  }
+
+  // 首次加载
+  loadHotPages();
 
   // ── Debounced suggest ──
   let suggestTimer = null;
@@ -90,6 +143,8 @@
       .then(r => r.json())
       .then(data => {
         renderResults(q, data);
+        // 搜索完成后刷新热门面板
+        loadHotPages();
       })
       .catch(() => {
         resultsArea.innerHTML =
@@ -117,14 +172,34 @@
       const title = highlightText(item.title || '无标题', keywords);
       const link = escapeHtml(item.link || '');
       const abstract = highlightText(item.abstract || '', keywords);
+      const sparseScore = item.sparseScore != null ? item.sparseScore.toFixed(4) : '-';
+      const denseScore = item.denseScore != null ? item.denseScore.toFixed(4) : '-';
       html +=
-        '<div class="result-item">' +
-          '<div class="result-title"><a href="' + escapeAttr(item.link) + '" target="_blank" rel="noopener">' + title + '</a></div>' +
+        '<div class="result-item" data-id="' + item.id + '" data-link="' + escapeAttr(item.link) + '">' +
+          '<div class="result-header">' +
+            '<div class="result-title"><a href="' + escapeAttr(item.link) + '" target="_blank" rel="noopener">' + title + '</a></div>' +
+            '<div class="result-scores">' +
+              '<span class="score-badge score-sparse" title="稀疏检索得分 (TF-IDF)">稀疏 ' + sparseScore + '</span>' +
+              '<span class="score-badge score-dense" title="稠密检索得分 (Dense)">稠密 ' + denseScore + '</span>' +
+            '</div>' +
+          '</div>' +
           '<div class="result-link">' + (link ? link : '&nbsp;') + '</div>' +
           '<div class="result-abstract">' + abstract + '</div>' +
         '</div>';
     });
     resultsArea.innerHTML = html;
+
+    // 搜索结果点击上报
+    resultsArea.querySelectorAll('.result-item').forEach(el => {
+      el.addEventListener('click', function (e) {
+        // 不阻止链接默认行为（新标签页打开），只上报
+        const docId = this.getAttribute('data-id');
+        if (docId) {
+          fetch('/click?id=' + encodeURIComponent(docId), { method: 'POST' })
+            .catch(() => {});
+        }
+      });
+    });
   }
 
   function extractKeywords(query) {

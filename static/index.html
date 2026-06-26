@@ -33,12 +33,21 @@
       <ul id="suggestions" class="suggestions hidden"></ul>
     </div>
 
-    <main id="resultsArea" class="results-area">
-      <div id="statusMsg" class="status-msg">
-        <p class="welcome-icon">&#128269;</p>
-        <p>输入关键词，开始搜索</p>
-      </div>
-    </main>
+    <div class="content-wrapper">
+      <main id="resultsArea" class="results-area">
+        <div id="statusMsg" class="status-msg">
+          <p class="welcome-icon">&#128269;</p>
+          <p>输入关键词，开始搜索</p>
+        </div>
+      </main>
+
+      <aside class="hot-sidebar" id="hotSidebar">
+        <h3 class="hot-title">&#128293; 热门网页 TOP10</h3>
+        <ol class="hot-list" id="hotList">
+          <li class="hot-loading">加载中...</li>
+        </ol>
+      </aside>
+    </div>
   </div>
 
   <footer class="footer">

@@ -1,5 +1,6 @@
 #include "PageProcessor.h"
 #include "DirectoryScanner.h"
+#include "Logger.h"
 
 #include <tinyxml2.h>
 #include <utfcpp/utf8.h>
@@ -7,6 +8,7 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <unordered_map>
 #include <set>
@@ -91,10 +93,12 @@ PageProcessor::PageProcessor()
 
 void PageProcessor::process(const string& dir)
 {
+    LOG_INFO("PageProcessor: starting pipeline from \"{}\"", dir);
     extract_documents(dir);
     deduplicate_documents();
     build_pages_and_offsets("data/pages.dat", "data/offsets.dat");
     build_inverted_index("data/inverted_index.dat");
+    LOG_INFO("PageProcessor: pipeline complete — {} documents indexed", documents_.size());
 }
 
 // ===================== Extract =====================
@@ -159,6 +163,7 @@ void PageProcessor::extract_documents(const string& dir)
             documents_.push_back(move(d));
         }
     }
+    LOG_INFO("  Extracted {} documents from {} XML files", documents_.size(), files.size());
 }
 
 // ===================== Dedup =====================
@@ -210,6 +215,9 @@ void PageProcessor::deduplicate_documents()
         }
     }
     documents_ = move(deduped);
+    size_t removed = n - documents_.size();
+    LOG_INFO("  Dedup: {} removed, {} kept ({}%)", removed, documents_.size(),
+             n > 0 ? 100 * documents_.size() / n : 0);
 }
 
 // ===================== Build pages & offsets =====================
@@ -233,6 +241,7 @@ void PageProcessor::build_pages_and_offsets(const string& pages_file,
         pfs << xml;//把xml写入后，pfs流的位置会改变
         ofs << doc.id << '\t' << offset << '\t' << xml.size() << '\n';
     }
+    LOG_INFO("  Built pages.dat + offsets.dat ({} entries)", documents_.size());
 }
 
 // ===================== Inverted index =====================
@@ -262,12 +271,17 @@ void PageProcessor::build_inverted_index(const string& filename)
             // skip invalid tokens
             if (w.empty()) continue;
             if (w.find_first_not_of(" \t\n\r\f\v") == string::npos) continue;
-            if (stopWords_.count(w)) continue;
+            // ASCII 小写归一化，确保大小写一致的查询能命中
+            string term = w;
+            for (char& c : term)
+                if (static_cast<unsigned char>(c) < 0x80)
+                    c = std::tolower(static_cast<unsigned char>(c));
+            if (stopWords_.count(term)) continue;
 
-            ++doc_tf[id][w];//该文档下这个关键字的频次数量加一
+            ++doc_tf[id][term];//该文档下这个关键字的频次数量加一
             ++total;//该文档总关键字数量加一
-            words_in_doc.insert(w);//把这个关键字存到set里面
-            all_words.insert(w);//存到所有文档的总关键字set
+            words_in_doc.insert(term);//把这个关键字存到set里面
+            all_words.insert(term);//存到所有文档的总关键字set
         }
 
         // store total word count as a special entry
@@ -323,4 +337,5 @@ void PageProcessor::build_inverted_index(const string& filename)
             ofs << '\t' << doc_id << '\t' << weight;
         ofs << '\n';
     }
+    LOG_INFO("  Built inverted_index.dat ({} terms)", invertedIndex_.size());
 }

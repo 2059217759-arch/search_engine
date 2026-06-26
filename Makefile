@@ -1,6 +1,6 @@
 CXX := g++
 CXXFLAGS := -std=c++17 -Wall -O2
-INCLUDES := -I./include -I/usr/local/include
+INCLUDES := -I./include -I./third_party/spdlog/include -I/usr/local/include
 
 SRCDIR := src
 OBJDIR := build
@@ -10,7 +10,8 @@ SERVER_TARGET := $(BINDIR)/main
 OFFLINE_TARGET := $(BINDIR)/offline
 
 SERVER_OBJS := $(OBJDIR)/SearchServer.o $(OBJDIR)/SearchService.o $(OBJDIR)/KeywordRecommender.o \
-               $(OBJDIR)/DenseRetriever.o
+               $(OBJDIR)/DenseRetriever.o $(OBJDIR)/QueryCache.o $(OBJDIR)/HotTracker.o \
+               $(OBJDIR)/DocCache.o
 OFFLINE_OBJS := $(OBJDIR)/offline.o $(OBJDIR)/DirectoryScanner.o \
                 $(OBJDIR)/KeywordProcessor.o $(OBJDIR)/PageProcessor.o
 

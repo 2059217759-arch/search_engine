@@ -1,5 +1,6 @@
 #include "SearchService.h"
 #include "DenseRetriever.h"
+#include "Logger.h"
 
 #include <tinyxml2.h>
 #include <utfcpp/utf8.h>
@@ -8,6 +9,7 @@
 
 #include <sstream>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <unordered_set>
 #include <unordered_map>
@@ -63,7 +65,10 @@ bool SearchService::init(const string& pagesFile,
 {
     // 加载偏移库
     ifstream ofs(offsetsFile);
-    if (!ofs) return false;
+    if (!ofs) {
+        LOG_ERROR("Failed to open offsets file: {}", offsetsFile);
+        return false;
+    }
     string line;
     while (getline(ofs, line)) {
         auto parts = split(line, '\t');
@@ -75,10 +80,14 @@ bool SearchService::init(const string& pagesFile,
     }
     //这里获取了总文档数，后面用
     totalDocs_ = offsets_.size();
+    LOG_INFO("Loaded {} document offsets from {}", totalDocs_, offsetsFile);
 
     // 加载倒排索引
     ifstream ifs(indexFile);
-    if (!ifs) return false;
+    if (!ifs) {
+        LOG_ERROR("Failed to open inverted index file: {}", indexFile);
+        return false;
+    }
     while (getline(ifs, line)) {
         auto parts = split(line, '\t');
         if (parts.size() < 2) continue;
@@ -89,6 +98,7 @@ bool SearchService::init(const string& pagesFile,
             invertedIndex_[keyword].emplace_back(docId, weight);
         }
     }
+    LOG_INFO("Loaded {} terms into inverted index", invertedIndex_.size());
 
     // 打开网页库供后续按 id 读取
     pagesStream_.open(pagesFile);
@@ -97,8 +107,12 @@ bool SearchService::init(const string& pagesFile,
     dense_ = new DenseRetriever();
     if (dense_->load("data/doc_embeddings.dat")) {
         denseAvailable_ = true;
+    } else {
+        LOG_WARN("Dense retriever not available, will use TF-IDF only");
     }
 
+    LOG_INFO("SearchService init complete: {} docs, {} terms, dense={}",
+             totalDocs_, invertedIndex_.size(), denseAvailable_ ? "yes" : "no");
     return pagesStream_.good();//返回打开状态
 }
 
@@ -108,6 +122,15 @@ string SearchService::search(const string& query, int topK)
 {
     if (totalDocs_ == 0) return "[]";
 
+    // 0. 查询缓存（L1）
+    {
+        string cached;
+        if (queryCache_.get(query, cached)) {
+            LOG_DEBUG("L1 cache hit for query: \"{}\"", query);
+            return cached;
+        }
+    }
+
     // 1. 分词 + 过滤停用词
     vector<string> rawWords;
     tokenizer_.Cut(query, rawWords);//依旧mix方式
@@ -116,11 +139,20 @@ string SearchService::search(const string& query, int topK)
     for (const auto& w : rawWords) {
         if (w.empty()) continue;
         if (w.find_first_not_of(" \t\n\r\f\v") == string::npos) continue;
-        if (stopWords_.count(w)) continue; //w在停用词的集合里
-        keywords.push_back(w);
+        // ASCII 小写归一化，与离线索引保持一致
+        string kw = w;
+        for (char& c : kw)
+            if (static_cast<unsigned char>(c) < 0x80)
+                c = std::tolower(static_cast<unsigned char>(c));
+        if (stopWords_.count(kw)) continue;
+        keywords.push_back(kw);
     }
 
-    if (keywords.empty()) return "[]";
+    if (keywords.empty()) {
+        LOG_DEBUG("Empty keywords for query: \"{}\"", query);
+        return "[]";
+    }
+    LOG_DEBUG("Query \"{}\": {} keywords after tokenization", query, keywords.size());
 
     // 2. 计算查询 TF-IDF 基准向量
     // queryVec是map<string,double> 关键字-权重
@@ -196,8 +228,12 @@ string SearchService::search(const string& query, int topK)
 
             // 拿着这个向量去匹配本地的向量索引
             auto denseResults = dense_->search(qEmb, topK * 3);
+            LOG_DEBUG("Dense retrieval returned {} candidates for query \"{}\"",
+                      denseResults.size(), query);
             for (const auto& [docId, score] : denseResults)
                 denseScores[docId] = score;
+        } else {
+            LOG_DEBUG("Dense embedding unavailable for query \"{}\", fell back to sparse only", query);
         }
     }
 
@@ -246,26 +282,51 @@ string SearchService::search(const string& query, int topK)
     if ((int)scored.size() > topK)
         scored.resize(topK);
 
+    LOG_DEBUG("Search \"{}\": {} sparse + {} dense -> {} final (mode: {})",
+              query, candidateDocs.size(), denseScores.size(), scored.size(),
+              (denseAvailable_ && !denseScores.empty()) ? "hybrid" : "sparse");
+
     // 5. 构建 JSON 结果
     ostringstream json;
     json << "[";
     for (size_t i = 0; i < scored.size(); ++i) {
         int docId = scored[i].first;
+        double finalScore = scored[i].second;
         auto doc = loadDocument(docId);
-        string abstract = generateAbstract(doc.content, 300);
+        string abstract = generateAbstract(doc.content, keywords, 300);
+
+        // 查找稀疏检索得分 (TF-IDF cosine, 0~1)
+        double sparseScore = 0.0;
+        auto itTf = tfidfScores.find(docId);
+        if (itTf != tfidfScores.end())
+            sparseScore = itTf->second;
+
+        // 查找稠密检索得分 (归一化到 0~1)
+        double denseScore = 0.0;
+        auto itDense = denseScores.find(docId);
+        if (itDense != denseScores.end())
+            denseScore = (itDense->second + 1.0) / 2.0;
 
         if (i > 0) json << ",";
         json << "\n  {"
              << "\"id\":" << doc.id << ","
              << "\"title\":\"" << jsonEscape(doc.title) << "\","
              << "\"link\":\"" << jsonEscape(doc.link) << "\","
-             << "\"abstract\":\"" << jsonEscape(abstract) << "\""
+             << "\"abstract\":\"" << jsonEscape(abstract) << "\","
+             << "\"sparseScore\":" << sparseScore << ","
+             << "\"denseScore\":" << denseScore << ","
+             << "\"finalScore\":" << finalScore
              << "}";
     }
     if (!scored.empty()) json << "\n";
     json << "]";
 
-    return json.str();
+    string result = json.str();
+
+    // 存入 L1 缓存
+    queryCache_.put(query, result);
+
+    return result;
 }
 
 // ===================== 查询向量 =====================
@@ -309,21 +370,15 @@ double SearchService::cosineSimilarity(
     const map<string, double>& queryVec,
     const map<string, double>& docWeights)
 {
-    double dot = 0.0, normQ = 0.0, normD = 0.0;
-
+    // 两个向量在构建时都已 L2 归一化（||q||=1, ||d||=1），
+    // 因此余弦相似度 = 点积，无需再算范数。
+    double dot = 0.0;
     for (const auto& [term, qw] : queryVec) {
-        normQ += qw * qw;
         auto it = docWeights.find(term);
-        if (it != docWeights.end()) {
-            double dw = it->second;
-            dot += qw * dw;
-            normD += dw * dw;
-        }
-        // 文档中该词权重为 0 → 不影响 dot 但影响 normQ
+        if (it != docWeights.end())
+            dot += qw * it->second;
     }
-
-    double denom = sqrt(normQ) * sqrt(normD);
-    return (denom > 0) ? dot / denom : 0.0;
+    return dot;
 }
 
 // ===================== Dense: libcurl query embedding =====================
@@ -358,21 +413,31 @@ vector<float> SearchService::fetchQueryEmbedding(const string& query) {
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 
-    if (res != CURLE_OK) return {};
+    if (res != CURLE_OK) {
+        LOG_WARN("Embedding service request failed: {}", curl_easy_strerror(res));
+        return {};
+    }
 
     try {
         auto j = nlohmann::json::parse(response);
-        return j.at("embedding").get<vector<float>>();
+        auto emb = j.at("embedding").get<vector<float>>();
+        LOG_TRACE("Embedding received: {} dims", emb.size());
+        return emb;
     } catch (...) {
+        LOG_WARN("Failed to parse embedding response for query \"{}\"", query);
         return {};
     }
 }
 
 // ===================== 加载文档 =====================
 
-SearchService::DocMeta SearchService::loadDocument(int docId)
+DocMeta SearchService::loadDocument(int docId)
 {
+    // L3: 文档内容缓存
     DocMeta meta;
+    if (docCache_.get(docId, meta))
+        return meta;
+
     meta.id = docId;
 
     auto offIt = offsets_.find(docId);
@@ -408,43 +473,134 @@ SearchService::DocMeta SearchService::loadDocument(int docId)
     auto* contentEl = root->FirstChildElement("content");
     if (contentEl && contentEl->GetText()) meta.content = contentEl->GetText();
 
+    // 存入文档缓存（只存有效文档）
+    if (!meta.link.empty() || !meta.title.empty())
+        docCache_.put(docId, meta);
+
     return meta;
 }
 
 // ===================== 摘要 =====================
 
-string SearchService::generateAbstract(const string& content, int maxLen)
+// UTF-8 安全：判断当前字节是否为多字节字符的后续字节
+static inline bool isUtf8Continuation(unsigned char c) {
+    return (c & 0xC0) == 0x80;
+}
+
+// 在 UTF-8 文本中执行大小写不敏感搜索
+// ASCII 字母忽略大小写；非 ASCII 字节（UTF-8 多字节部分）须精确匹配
+static size_t findKeyword(const string& text, const string& keyword) {
+    if (keyword.empty()) return string::npos;
+
+    auto it = search(text.begin(), text.end(), keyword.begin(), keyword.end(),
+        [](char a, char b) {
+            unsigned char ua = static_cast<unsigned char>(a);
+            unsigned char ub = static_cast<unsigned char>(b);
+            // ASCII 范围：忽略大小写
+            if (ua < 0x80 && ub < 0x80)
+                return tolower(ua) == tolower(ub);
+            // 非 ASCII（UTF-8 多字节）：精确匹配
+            return a == b;
+        });
+    if (it == text.end()) return string::npos;
+    return distance(text.begin(), it);
+}
+
+string SearchService::generateAbstract(const string& content,
+                                        const vector<string>& keywords,
+                                        int maxLen)
 {
     if ((int)content.size() <= maxLen)
         return content;
 
-    // 取前 maxLen 字节，回退到合法的 UTF-8 字符边界
-    // UTF-8 编码中，英文字符占 1 个字节，而中文等字符通常占 3 个字节
-    // 多字节字符的后续字节（如中文的第二、三个字节）：必须且只能以 10xxxxxx 开头
-    // while里面的意思是如果是中文词的后续字节，回退
-    int cut = maxLen;
-    while (cut > 0 && ((unsigned char)content[cut] & 0xC0) == 0x80)
-        --cut;
-
-    if (cut == 0)
-        return "";
-
-    string s = content.substr(0, cut);
-
-    // 只在 ASCII 标点及完整 CJK 标点处截断（避免匹配多字节字符的内部字节）
-    static const string delims[] = {"。", "，", "！", "？", ",", ".", "!", "?", " "};
-    size_t best = string::npos;
-    // 遍历所有标点，找到最末尾的标点best
-    for (const auto& d : delims) {
-        auto pos = s.rfind(d);
-        if (pos != string::npos && (best == string::npos || pos > best))
-            best = pos;
+    // ── 1. 找到所有关键词中最早出现的位置 ──
+    size_t firstMatch = string::npos;
+    for (const auto& kw : keywords) {
+        size_t pos = findKeyword(content, kw);
+        if (pos != string::npos && pos < firstMatch)
+            firstMatch = pos;
     }
-    // 阈值处理，如果截断太多了也不好，回退到前面的cut
-    if (best != string::npos && (int)best > cut * 2 / 3)
-        s = s.substr(0, best);
 
-    return s + "...";
+    // ── 2. 无匹配 → 回退静态摘要（取文档开头） ──
+    if (firstMatch == string::npos) {
+        int cut = maxLen;
+        while (cut > 0 && isUtf8Continuation((unsigned char)content[cut]))
+            --cut;
+        if (cut == 0) return "";
+
+        string s = content.substr(0, cut);
+        static const string delims[] = {"。", "，", "！", "？", ",", ".", "!", "?", " "};
+        size_t best = string::npos;
+        for (const auto& d : delims) {
+            auto pos = s.rfind(d);
+            if (pos != string::npos && (best == string::npos || pos > best))
+                best = pos;
+        }
+        if (best != string::npos && (int)best > cut * 2 / 3)
+            s = s.substr(0, best);
+        return s + "...";
+    }
+
+    // ── 3. 以关键词为中心提取上下文窗口 ──
+    // 窗口起点：关键词前移 1/3 窗口，让关键词大约在靠前 1/3 处
+    size_t prefix = maxLen / 3;
+    size_t windowStart = (firstMatch > prefix) ? firstMatch - prefix : 0;
+
+    // 对齐 UTF-8 字符边界（不能切在多字节字符中间）
+    while (windowStart > 0 && isUtf8Continuation((unsigned char)content[windowStart]))
+        --windowStart;
+
+    size_t windowEnd = windowStart + maxLen;
+    if (windowEnd < content.size()) {
+        // 延伸至完整的 UTF-8 字符末尾
+        while (windowEnd < content.size() && isUtf8Continuation((unsigned char)content[windowEnd]))
+            ++windowEnd;
+    } else {
+        windowEnd = content.size();
+    }
+
+    string snippet = content.substr(windowStart, windowEnd - windowStart);
+
+    // ── 4. 微调：尝试在句子边界截断，使摘要更自然 ──
+    static const string sentDelims[] = {"。", "！", "？", "\n", ". ", "! ", "? "};
+    static const int sentDelimLen[] = {3, 3, 3, 1, 2, 2, 2};  // UTF-8 字节长度
+    // 去掉开头可能的不完整句子：找到第一个句子分隔符，从其后开始
+    if (windowStart > 0) {
+        size_t firstDelim = string::npos;
+        size_t delimBytes = 0;
+        for (int di = 0; di < 7; ++di) {
+            auto pos = snippet.find(sentDelims[di]);
+            if (pos != string::npos && pos < firstDelim) {
+                firstDelim = pos;
+                delimBytes = sentDelimLen[di];
+            }
+        }
+        // 只在分隔符不太远时裁剪（< 窗口的 1/4），避免截掉太多
+        if (firstDelim != string::npos && firstDelim < snippet.size() / 4) {
+            snippet = snippet.substr(firstDelim + delimBytes);
+        }
+    }
+    // 去掉末尾的不完整句子
+    if (windowEnd < content.size()) {
+        size_t lastDelim = string::npos;
+        for (int di = 0; di < 7; ++di) {
+            auto pos = snippet.rfind(sentDelims[di]);
+            if (pos != string::npos && (lastDelim == string::npos || pos > lastDelim))
+                lastDelim = pos;
+        }
+        if (lastDelim != string::npos && lastDelim > snippet.size() * 2 / 3) {
+            snippet = snippet.substr(0, lastDelim + 1);
+        }
+    }
+
+    if (snippet.empty()) return "";
+
+    // ── 5. 添加省略号 ──
+    // 重新确定实际窗口在原文中的位置
+    if (windowStart > 0) snippet = "..." + snippet;
+    if (windowEnd < content.size()) snippet = snippet + "...";
+
+    return snippet;
 }
 
 // ===================== JSON 转义 =====================
@@ -464,4 +620,57 @@ string SearchService::jsonEscape(const string& s)
         }
     }
     return result;
+}
+
+// ===================== 缓存管理 =====================
+
+void SearchService::setCacheMaxSize(size_t n) {
+    queryCache_.setMaxSize(n);
+}
+
+void SearchService::setCacheTtl(int seconds) {
+    queryCache_.setTtl(seconds);
+}
+
+string SearchService::cacheStats() const {
+    return queryCache_.stats();
+}
+
+// ===================== 热门文档 =====================
+
+string SearchService::hotPages(int k) {
+    auto top = hotTracker_.topK(k);
+    if (top.empty()) return "[]";
+
+    ostringstream json;
+    json << "[";
+    for (size_t i = 0; i < top.size(); ++i) {
+        int docId = top[i].first;
+        uint64_t clickCount = top[i].second;
+        auto doc = loadDocument(docId);
+
+        if (i > 0) json << ",";
+        json << "\n  {"
+             << "\"rank\":" << (i + 1) << ","
+             << "\"id\":" << docId << ","
+             << "\"title\":\"" << jsonEscape(doc.title) << "\","
+             << "\"link\":\"" << jsonEscape(doc.link) << "\","
+             << "\"clickCount\":" << clickCount
+             << "}";
+    }
+    if (!top.empty()) json << "\n";
+    json << "]";
+    return json.str();
+}
+
+string SearchService::hotStats() const {
+    ostringstream oss;
+    oss << "{\"uniqueDocs\":" << hotTracker_.uniqueDocs()
+        << ",\"totalClicks\":" << hotTracker_.totalClicks()
+        << "}";
+    return oss.str();
+}
+
+void SearchService::recordClick(int docId) {
+    hotTracker_.recordClick(docId);
 }

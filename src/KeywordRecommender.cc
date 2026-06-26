@@ -1,4 +1,5 @@
 #include "KeywordRecommender.h"
+#include "Logger.h"
 
 #include <utfcpp/utf8.h>
 
@@ -34,10 +35,17 @@ bool KeywordRecommender::init(const string& cnDictFile, const string& enDictFile
         return true;
     };
 
-    if (!loadDict(cnDictFile)) return false;
-    if (!loadDict(enDictFile)) return false;
+    if (!loadDict(cnDictFile)) {
+        LOG_ERROR("KeywordRecommender: failed to load CN dict: {}", cnDictFile);
+        return false;
+    }
+    if (!loadDict(enDictFile)) {
+        LOG_ERROR("KeywordRecommender: failed to load EN dict: {}", enDictFile);
+        return false;
+    }
 
     initialized_ = true;
+    LOG_INFO("KeywordRecommender initialized: {} words in trie", allWords_.size());
     return true;
 }
 
