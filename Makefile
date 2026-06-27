@@ -13,7 +13,8 @@ SERVER_OBJS := $(OBJDIR)/SearchServer.o $(OBJDIR)/SearchService.o $(OBJDIR)/Keyw
                $(OBJDIR)/DenseRetriever.o $(OBJDIR)/QueryCache.o $(OBJDIR)/HotTracker.o \
                $(OBJDIR)/DocCache.o
 OFFLINE_OBJS := $(OBJDIR)/offline.o $(OBJDIR)/DirectoryScanner.o \
-                $(OBJDIR)/KeywordProcessor.o $(OBJDIR)/PageProcessor.o
+                $(OBJDIR)/KeywordProcessor.o $(OBJDIR)/PageProcessor.o \
+                $(OBJDIR)/KeywordRecommender.o
 
 SERVER_LDFLAGS := -lpthread -L/usr/local/lib -ltinyxml2 -lworkflow -lwfrest -lcurl
 OFFLINE_LDFLAGS := -lpthread -L/usr/local/lib -ltinyxml2

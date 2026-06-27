@@ -12,6 +12,12 @@ public:
 
     bool init(const std::string& cnDictFile, const std::string& enDictFile);
 
+    // 将 Trie 和 allWords_ 序列化为二进制文件（离线流程调用）
+    bool saveBinary(const std::string& filepath) const;
+
+    // 从二进制文件加载 Trie 和 allWords_（运行时调用，比 init 快得多）
+    bool loadBinary(const std::string& filepath);
+
     // 返回 JSON 格式的推荐结果
     // type: "prefix" 表示前缀匹配, "correction" 表示纠错建议
     std::string suggest(const std::string& query, int topK = 5);

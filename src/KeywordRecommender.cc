@@ -49,6 +49,139 @@ bool KeywordRecommender::init(const string& cnDictFile, const string& enDictFile
     return true;
 }
 
+// ===================== 二进制序列化 =====================
+
+bool KeywordRecommender::saveBinary(const string& filepath) const
+{
+    ofstream ofs(filepath, ios::binary);
+    if (!ofs) {
+        LOG_ERROR("KeywordRecommender::saveBinary: failed to open {}", filepath);
+        return false;
+    }
+
+    auto write = [&ofs](const void* data, size_t size) {
+        ofs.write(reinterpret_cast<const char*>(data), size);
+    };
+
+    // Header: magic + version
+    const char magic[4] = {'T', 'R', 'I', 'E'};
+    uint32_t version = 1;
+    write(magic, 4);
+    write(&version, 4);
+
+    // allWords_ section
+    uint64_t wordCount = allWords_.size();
+    write(&wordCount, 8);
+    for (const auto& [word, freq] : allWords_) {
+        uint32_t len = static_cast<uint32_t>(word.size());
+        write(&len, 4);
+        write(word.data(), len);
+        write(&freq, 8);
+    }
+
+    // Trie section — preorder DFS
+    function<void(const TrieNode*)> writeNode = [&](const TrieNode* node) {
+        uint8_t isEnd = node->isEnd ? 1 : 0;
+        write(&isEnd, 1);
+        write(&node->freq, 8);
+        uint32_t numChildren = static_cast<uint32_t>(node->children.size());
+        write(&numChildren, 4);
+        for (const auto& [key, child] : node->children) {
+            uint16_t keyLen = static_cast<uint16_t>(key.size());
+            write(&keyLen, 2);
+            write(key.data(), keyLen);
+            writeNode(child.get());
+        }
+    };
+
+    writeNode(&root_);
+
+    LOG_INFO("KeywordRecommender::saveBinary: saved {} words to {}", allWords_.size(), filepath);
+    return true;
+}
+
+bool KeywordRecommender::loadBinary(const string& filepath)
+{
+    ifstream ifs(filepath, ios::binary);
+    if (!ifs) {
+        LOG_WARN("KeywordRecommender::loadBinary: file not found: {}", filepath);
+        return false;
+    }
+
+    auto read = [&ifs](void* data, size_t size) {
+        ifs.read(reinterpret_cast<char*>(data), size);
+    };
+    auto checkEof = [&ifs]() -> bool {
+        return ifs.eof() || ifs.fail();
+    };
+
+    // Header: magic + version
+    char magic[4];
+    uint32_t version;
+    read(magic, 4);
+    if (checkEof() || strncmp(magic, "TRIE", 4) != 0) {
+        LOG_ERROR("KeywordRecommender::loadBinary: invalid magic in {}", filepath);
+        return false;
+    }
+    read(&version, 4);
+    if (checkEof() || version != 1) {
+        LOG_ERROR("KeywordRecommender::loadBinary: unsupported version {} in {}", version, filepath);
+        return false;
+    }
+
+    // allWords_ section
+    allWords_.clear();
+    uint64_t wordCount;
+    read(&wordCount, 8);
+    if (checkEof()) return false;
+    allWords_.reserve(wordCount);
+    for (uint64_t i = 0; i < wordCount; ++i) {
+        uint32_t len;
+        read(&len, 4);
+        if (checkEof()) return false;
+        string word(len, '\0');
+        read(&word[0], len);
+        uint64_t freq;
+        read(&freq, 8);
+        if (checkEof()) return false;
+        allWords_.emplace_back(move(word), freq);
+    }
+
+    // Trie section — recursive reconstruction
+    root_ = TrieNode();  // reset root
+
+    function<void(TrieNode*)> readNode = [&](TrieNode* node) {
+        uint8_t isEnd;
+        read(&isEnd, 1);
+        read(&node->freq, 8);
+        node->isEnd = (isEnd != 0);
+
+        uint32_t numChildren;
+        read(&numChildren, 4);
+        for (uint32_t i = 0; i < numChildren; ++i) {
+            uint16_t keyLen;
+            read(&keyLen, 2);
+            if (checkEof()) return;
+            string key(keyLen, '\0');
+            read(&key[0], keyLen);
+            auto child = make_unique<TrieNode>();
+            TrieNode* childPtr = child.get();
+            node->children[move(key)] = move(child);
+            readNode(childPtr);
+        }
+    };
+
+    readNode(&root_);
+    if (checkEof()) {
+        LOG_ERROR("KeywordRecommender::loadBinary: unexpected EOF in {}", filepath);
+        return false;
+    }
+
+    initialized_ = true;
+    LOG_INFO("KeywordRecommender::loadBinary: loaded {} words from {}", allWords_.size(), filepath);
+    return true;
+}
+
 // ===================== Trie 构建 =====================
 // 针对一个单词，从左向右遍历，拆成一条树枝
 void KeywordRecommender::insert(const string& word, uint64_t freq)

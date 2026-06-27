@@ -24,7 +24,7 @@
 
 - 🔡 **中英文双语支持** — 中文采用 jieba 分词，英文采用空格分词，停用词过滤
 - 🔀 **混合检索** — TF-IDF 稀疏检索 + BGE 稠密向量检索，线性加权融合
-- 💡 **关键词联想** — 基于 Trie 的前缀匹配 + 编辑距离纠错，实时补全
+- 💡 **关键词联想** — 基于 Trie 的前缀匹配 + 编辑距离纠错，实时补全；Trie 离线序列化，启动即加载
 - 🗂️ **离线-在线分离** — 索引构建与搜索服务独立部署，互不干扰
 - ⚡ **高性能 C++ 核心** — C++17 + wfrest 异步 HTTP 框架，低延迟响应
 - 🎨 **简洁 Web UI** — 仿搜索引擎风格的 SPA 前端，支持高亮、键盘导航
@@ -47,6 +47,9 @@ flowchart TB
 
         KP1 --> F1[(cn_dict.dat<br/>cn_index.dat)]
         KP2 --> F2[(en_dict.dat<br/>en_index.dat)]
+        F1 --> KR[KeywordRecommender<br/>构建Trie → saveBinary]
+        F2 --> KR
+        KR --> F5[(trie.dat)]
         PP --> F3[(pages.dat<br/>offsets.dat<br/>inverted_index.dat)]
     end
 
@@ -58,9 +61,8 @@ flowchart TB
     subgraph 在线模块["🌐 在线搜索服务 (bin/main)"]
         direction TB
         B1[wfrest HTTP Server :8080] --> B2[SearchService]
-        B2 --> B3[KeywordRecommender<br/>Trie 前缀 + 编辑距离]
-        B3 --> F1
-        B3 --> F2
+        B2 --> B3[KeywordRecommender<br/>Trie 前缀 + 编辑距离<br/>loadBinary 从 trie.dat]
+        B3 --> F5
         B2 --> F3
         B2 --> F4
         B2 --> B4[QueryCache &#124; DocCache<br/>双层查询缓存]
@@ -287,7 +289,7 @@ Search_Engine_cpp/
 ├── include/                        # 头文件 (11 个)
 │   ├── DirectoryScanner.h          # 目录扫描器
 │   ├── KeywordProcessor.h          # 关键词词典构建器
-│   ├── KeywordRecommender.h        # Trie + 编辑距离推荐
+│   ├── KeywordRecommender.h        # Trie + 编辑距离 + 二进制序列化
 │   ├── Logger.h                    # 全局日志系统（spdlog 封装）
 │   ├── PageProcessor.h             # 网页索引构建器
 │   ├── SearchServer.h              # HTTP 服务入口
@@ -301,7 +303,7 @@ Search_Engine_cpp/
 │   ├── offline.cc                  # 离线流水线入口
 │   ├── DirectoryScanner.cc         # POSIX 目录遍历
 │   ├── KeywordProcessor.cc         # 中英文词典构建
-│   ├── KeywordRecommender.cc       # Trie 实现 + 编辑距离
+│   ├── KeywordRecommender.cc       # Trie 实现 + 编辑距离 + 二进制序列化
 │   ├── PageProcessor.cc            # XML 解析 + SimHash + TF-IDF
 │   ├── SearchServer.cc             # main() + HTTP 路由
 │   ├── SearchService.cc            # 搜索 + 融合 + 缓存 + libcurl
@@ -343,9 +345,41 @@ Search_Engine_cpp/
     ├── en_dict.dat                 # 英文词典
     ├── cn_index.dat                # 中文字符索引
     ├── en_index.dat                # 英文字符索引
+    ├── trie.dat                    # 序列化 Trie（离线构建，运行时直接加载）
     └── doc_embeddings.dat          # 稠密向量 (可选)
 ```
+## 项目并发访问支持分析
 
+### 整体架构
+并发能力完全由 wfrest/workflow 框架提供，项目本身没有自定义线程池。框架默认配置：20 个 handler 线程、4 个 poller 线程、4 个 DNS 线程，计算线程数 = CPU 核心数。
+
+### 各模块线程安全状态
+
+| 模块 | 同步原语 | 线程安全? | 说明 |
+|---|---|---|---|
+| **SearchServer** | 无（依赖框架） | ✅ | 路由注册不带 `compute_queue_id`，所有 handler 共享默认线程池 |
+| **SearchService** | `std::mutex pagesMutex_` | ⚠️ 部分 | `pagesStream_` 已加锁，但 `tokenizer_.Cut()` 存在数据竞争风险 |
+| **QueryCache** | `std::shared_mutex` | ✅ | 读写锁 + TOCTOU 安全处理，LRU 淘汰正确 |
+| **DocCache** | `std::shared_mutex` | ✅ | 与 QueryCache 相同模式，实现正确 |
+| **HotTracker** | `std::shared_mutex` | ✅ | 写操作用 unique_lock，读操作用 shared_lock |
+| **DenseRetriever** | 无 | ✅ | 初始化后只读，不可变数据并发读取安全 |
+| **KeywordRecommender** | 无 | ✅ | Trie 树初始化后不可变，所有访问只读 |
+| **Logger** | spdlog 内部 | ✅ | 使用 `_mt`（多线程）sink，spdlog 内部加锁 |
+| **offline 管线** | 无 | N/A | 纯单线程离线处理 |
+
+### 缓存结构并发分析
+QueryCache / DocCache — ⚠️ 读可以并发，但 LRU Touch 串行化（写）
+get() 分为两个阶段：
+
+阶段1: shared_lock  →  查找 + TTL检查 + 拷贝数据    ← 多线程可同时执行
+        ↓ unlock
+阶段2: unique_lock  →  LRU touch (splice到队首)     ← 只能一个线程执行
+
+关键点：
+数据读取是并发的 — 多个线程可以同时 map_.find() + 拷贝 value，不会互相阻塞
+LRU touch 是串行的 — 每次命中后移动链表节点的 splice 操作用 unique_lock，只能排队
+
+ LRU touch 确实让每次缓存命中都需要一个短暂的独占锁，在高并发场景下会形成排队。不过 splice 是 O(1) 操作，实际持锁时间极短，在当前 20 线程规模下可能还不是瓶颈
 ## 依赖
 
 ### C++ 库
@@ -412,6 +446,12 @@ make clean && make
 # 运行离线流水线（生成 data/*.dat）
 ./bin/offline
 ```
+
+离线流水线分两个阶段：
+1. **Phase 1.1** — 中英文词典构建（`cn_dict.dat` / `en_dict.dat`），随后构建 Trie 并序列化为 `trie.dat`
+2. **Phase 1.2** — 网页索引构建（`pages.dat` / `offsets.dat` / `inverted_index.dat`）
+
+> `trie.dat` 是 Trie 树的二进制快照，在线服务启动时直接 `loadBinary()` 加载，跳过逐字符插入的构建过程，大幅缩短启动时间。
 
 ### 4. 生成文档稠密向量（可选）
 
@@ -587,6 +627,7 @@ Content-Type: application/json
 - 索引构建可离线运行，不阻塞在线服务
 - 索引数据和二进制可独立更新
 - 减少在线进程的内存占用（无需加载分词词库的完整状态）
+- Trie 树在离线阶段构建并序列化为 `trie.dat`，在线服务直接二进制加载，消除每次启动的重复构建开销
 
 ### 2. 自制文件存储，零数据库依赖
 

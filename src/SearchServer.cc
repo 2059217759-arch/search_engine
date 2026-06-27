@@ -22,10 +22,13 @@ int SearchServer::run(int port)
     }
     LOG_INFO("Index loaded: {} documents", searchService_.getTotalDocs());
 
-    // 加载关键字推荐数据（Trie）
-    if (!recommender_.init("data/cn_dict.dat", "data/en_dict.dat")) {
-        LOG_ERROR("Failed to load dict files for recommender");
-        return 1;
+    // 加载关键字推荐数据（优先加载序列化的 Trie，fallback 到 dict 文件）
+    if (!recommender_.loadBinary("data/trie.dat")) {
+        LOG_WARN("trie.dat not found, falling back to dict files...");
+        if (!recommender_.init("data/cn_dict.dat", "data/en_dict.dat")) {
+            LOG_ERROR("Failed to load dict files for recommender");
+            return 1;
+        }
     }
     LOG_INFO("Recommender Trie loaded");
 

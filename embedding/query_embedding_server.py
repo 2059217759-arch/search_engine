@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """FastAPI microservice for query embedding."""
 
+import os
+
+# 离线模式：仅使用本地缓存，不尝试连接 huggingface.co
+os.environ["HF_HUB_OFFLINE"] = "1"
+
 from fastapi import FastAPI
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
